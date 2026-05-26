@@ -2941,6 +2941,36 @@ async function syncStockToSupabase() {
   var saveBtn = document.getElementById('stk-save-btn');
   if (saveBtn) saveBtn.style.display = 'none';
   var statusEl = document.getElementById('stk-status');
+  if (statusEl) { statusEl.textContent = '⏳ กำลัง update ยอด...'; statusEl.style.color = '#f59e0b'; }
+  toast('⏳ กำลัง update total_qty...');
+
+  // อัปเดต total_qty จาก stock_batches อัตโนมัติ
+  try {
+    var rpcResp = await fetch(SB_URL + '/rest/v1/rpc/update_stock_total_qty', {
+      method: 'POST',
+      headers: authHeaders(_tok, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify({})
+    });
+    if (!rpcResp.ok) {
+      // fallback: update ทีละ item จาก _stockMaster
+      await loadStockMaster();
+      for (var m = 0; m < _stockMaster.length; m++) {
+        var sm = _stockMaster[m];
+        if (!sm.id) continue;
+        var batchQty = allBatches.filter(function(b){ return b.item_id === sm.id; })
+                                 .reduce(function(s,b){ return s + (b.qty||0); }, 0);
+        if (batchQty > 0) {
+          await fetch(SB_URL + '/rest/v1/stock_items?id=eq.' + sm.id, {
+            method: 'PATCH',
+            headers: authHeaders(_tok, { 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }),
+            body: JSON.stringify({ total_qty: batchQty })
+          });
+        }
+      }
+    }
+  } catch(e) { console.warn('update total_qty error:', e); }
+
+  await loadStockMaster();
   if (statusEl) { statusEl.textContent = '☁️ บันทึกแล้ว: '+ok+' รายการ'+(fail?' (fail:'+fail+')':''); statusEl.style.color = ok>0?'#10b981':'#ef4444'; }
   toast('✅ Sync เสร็จ: '+ok+' รายการ'+(fail?' (fail:'+fail+')':''));
   if (typeof renderStk === 'function') renderStk();
