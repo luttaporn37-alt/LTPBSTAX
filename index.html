@@ -4127,7 +4127,7 @@ function billStatus(inv) {
   if (!inv.date) return {status:'unknown', months:null, deadline:null};
   const issueDate = new Date(inv.date);
   if (isNaN(issueDate)) return {status:'unknown', months:null, deadline:null};
-  // deadline = วันที่ออก + 6 เดือน
+  // deadline = วันที่ออกบิล + 6 เดือน เช่น 3 เม.ย. → 3 ก.ย.
   const deadline = new Date(issueDate);
   deadline.setMonth(deadline.getMonth() + 6);
   const today = new Date();
@@ -9554,9 +9554,10 @@ function getFifoCost(stkItem, qty) {
 function applyMarkup(itemId, pct) {
   var item = siItems.find(function(x){ return x.id === itemId; });
   if (!item) return;
-  var stk = stock.find(function(s){ return s.name === item.name; });
-  if (!stk) return;
-  var baseCost = getFifoCost(stk, item.qty || 1);
+  var stk = stock.find(function(s){ return s.name === item.name; })
+         || stock.find(function(s){ return s.code && item.code && s.code === item.code; })
+         || stock.find(function(s){ return s.name && item.name && s.name.trim() === item.name.trim(); });
+  var baseCost = stk ? getFifoCost(stk, item.qty || 1) : (item.cost || 0);
   // อัพเดต active button
   document.querySelectorAll('.markup-btn[data-iid="'+itemId+'"]').forEach(function(b){
     b.classList.toggle('on', parseFloat(b.dataset.pct) === pct);
@@ -9695,7 +9696,7 @@ async function doLogin() {
     document.getElementById('appShell').style.display = '';
     applyRoleRestrictions();
     // โหลดข้อมูลจาก Supabase
-    window._loginHandled = true;
+    window._initialPageShown = true;
     await loadFromSupabase();
     initYr(); showPage('dashboard');
   } catch(e) {
@@ -10504,6 +10505,11 @@ if (_sbMode === 'online') {
             document.getElementById('loginOverlay').style.display = 'none';
             document.getElementById('appShell').style.display = '';
             applyRoleRestrictions();
+            // ถ้า doLogin โหลดข้อมูลแล้ว ไม่ต้อง reset และ load ซ้ำ
+            if (window._initialPageShown) {
+              setupRealtime();
+              return;
+            }
             // ล้าง LocalStorage เก่าก่อน load ใหม่จาก Supabase
             localStorage.removeItem('taxDB');
             localStorage.removeItem('stockDB');
@@ -10511,11 +10517,10 @@ if (_sbMode === 'online') {
             stock = [];
             loadFromSupabase().then(function() {
               setupRealtime();
-              // ถ้า doLogin ทำงานแล้ว ไม่ต้อง showPage ซ้ำ
-              if (!window._loginHandled) {
+              if (!window._initialPageShown) {
+                window._initialPageShown = true;
                 initYr(); showPage('dashboard');
               }
-              window._loginHandled = true;
               setTimeout(function(){
                 try{ if(typeof buildSupplierDatalist==='function') { importSuppliersFromInvoices(true); } }catch(e){}
                 try{ if(typeof buildCustomerDatalist==='function') { importCustomersFromSell(true); } }catch(e){}
