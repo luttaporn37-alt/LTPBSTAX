@@ -3177,19 +3177,9 @@ async function syncStockToSupabase() {
   // กรองเฉพาะ batch ที่มี item_id จริงๆ
   allBatches = allBatches.filter(function(b){ return b.item_id; });
 
-  // ถ้า reset mode → ลบ batch เดิมของแต่ละ item ก่อน
-  if (isReset && allBatches.length) {
-    var itemIds = [...new Set(allBatches.map(function(b){ return b.item_id; }))];
-    for (var k = 0; k < itemIds.length; k += 20) {
-      var chunk = itemIds.slice(k, k+20);
-      try {
-        await fetch(SB_URL + '/rest/v1/stock_batches?item_id=in.('+chunk.join(',')+')', {
-          method: 'DELETE',
-          headers: authHeaders(_tok, {'Content-Type': 'application/json'})
-        });
-      } catch(e) { console.warn('delete old batches error:', e); }
-    }
-  }
+  // reset mode เดิมเคย DELETE batch ก่อน re-insert แต่ถูกยกเลิกแล้ว
+  // เหตุผล: batch UUID ที่ถูก fifo_allocations อ้างถึงต้องคงอยู่ตลอด (FK RESTRICT)
+  // upsert ด้วย on_conflict=id ด้านล่างจะ update qty/cost ทับของเดิมได้โดยตรง
 
   if (allBatches.length) {
     for (var j = 0; j < allBatches.length; j += batchSize) {
@@ -5740,14 +5730,27 @@ async function _doVoidSell(id, reason) {
         var st = stock.find(function(x){ return x.name===item.name; });
         if (!st) return;
         var returnQty = Math.abs(+(item.qty||0));
-        var bNo = 'VOID-'+s.invno;
-        st.batches.push({no:bNo, qty:returnQty, cost:+(item.cost||st.cost||0), date:voidDate, billRef:'VOID:'+s.invno});
-        st.total = Math.round(((+st.total||0) + returnQty)*100)/100;
+        // restore qty back to existing batches in FIFO order (oldest first = first consumed)
+        // zero-qty batches are preserved in local array after Sale for exactly this purpose
+        var rem = returnQty;
+        st.batches.forEach(function(b){
+          if (rem <= 0) return;
+          var restore = Math.min(rem, returnQty);
+          b.qty = Math.round((b.qty + restore) * 1000) / 1000;
+          rem -= restore;
+        });
+        // if all existing batches have been restored and qty remains (edge case: no batches)
+        // create a tracked batch with a stable UUID as fallback
+        if (rem > 0) {
+          st.batches.push({id: uid(), no: 'RTN-'+s.invno, qty: rem,
+            cost: +(item.cost||st.cost||0), date: voidDate, billRef: ''});
+        }
+        st.total = Math.round(((+st.total||0) + returnQty) * 100) / 100;
         _movements.unshift({
           type:'VOID', item_name:item.name, code:item.code||'', unit:item.unit||'',
           qty:returnQty, cost:+(item.cost||st.cost||0),
           date:voidDate, ref:'VOID:'+s.invno,
-          note:'ยกเลิกบิล: '+s.invno+' ('+s.customer+') เหตุผล: '+reason, batch_no:bNo
+          note:'ยกเลิกบิล: '+s.invno+' ('+s.customer+') เหตุผล: '+reason
         });
       });
         saveDB();
@@ -5796,9 +5799,70 @@ async function _doVoidSell(id, reason) {
               if (sm) sm.total_qty = newQty;
             } catch(e) { console.warn('VOID stock qty:', e); }
           })(returnQty, sbItem.id);
+          // sync stock_batches — restored qty must reach Supabase
+          // maintains invariant: SUM(stock_batches.qty) == stock_items.total_qty
+          var localItem = stock.find(function(st){ return st.name===item.name; });
+          if (localItem) syncBatchesToSupabase(localItem, sbItem.id, _tok);
         });
       });
       }
+    }
+    // INSERT fifo_allocations REVERSE — only for OUT rows not yet reversed
+    // idempotency is derived from the set of unreversed OUT rows, not from a REVERSE existence check.
+    // this supports multi-cycle lifecycle: Sale → Void → Restore → Void → Void (idempotent)
+    if (_sbMode==='online' && SB_URL && SB_KEY) {
+      try {
+        var _allocTok = await getToken();
+        var _invEnc = encodeURIComponent(s.id);
+        // step 1: fetch all OUT rows for this invoice
+        var outResp = await fetch(
+          SB_URL+'/rest/v1/fifo_allocations?invoice_id=eq.'+_invEnc+'&allocation_type=eq.OUT&select=id,batch_id,item_id,qty_allocated,cost_per_unit',
+          { headers: authHeaders(_allocTok) });
+        var outRows = outResp.ok ? await outResp.json() : [];
+        if (!outRows.length) {
+          console.warn('fifo_alloc REVERSE: no OUT rows found for', s.invno,
+            '— Sale allocation not recorded (pre-fifo_allocations sale or offline)');
+        } else {
+          // step 2: fetch reversed_allocation_id values from all existing REVERSE rows for this invoice
+          var revRefsResp = await fetch(
+            SB_URL+'/rest/v1/fifo_allocations?invoice_id=eq.'+_invEnc+'&allocation_type=eq.REVERSE&reversed_allocation_id=not.is.null&select=reversed_allocation_id',
+            { headers: authHeaders(_allocTok) });
+          var revRefs = revRefsResp.ok ? await revRefsResp.json() : [];
+          // step 3: build set of already-reversed OUT row ids
+          var alreadyReversedIds = new Set(revRefs.map(function(r){ return r.reversed_allocation_id; }));
+          // step 4: filter to OUT rows that have no REVERSE row pointing at them
+          var unreversedOut = outRows.filter(function(r){ return !alreadyReversedIds.has(r.id); });
+          // step 5: idempotent — nothing outstanding
+          if (!unreversedOut.length) {
+            console.log('fifo_alloc REVERSE: all OUT rows already reversed for', s.invno, '— skip');
+          } else {
+            var reverseRows = unreversedOut.map(function(r){
+              return {
+                invoice_id: s.id,
+                invoice_no: s.invno,
+                batch_id: r.batch_id,
+                item_id: r.item_id,
+                allocation_type: 'REVERSE',
+                reversed_allocation_id: r.id,
+                qty_allocated: r.qty_allocated,
+                cost_per_unit: r.cost_per_unit
+              };
+            });
+            var revInsResp = await fetch(SB_URL+'/rest/v1/fifo_allocations', {
+              method: 'POST',
+              headers: authHeaders(_allocTok, {'Content-Type':'application/json','Prefer':'return=minimal'}),
+              body: JSON.stringify(reverseRows)
+            });
+            if (!revInsResp.ok) {
+              var revErr = await revInsResp.text();
+              console.error('fifo_allocations REVERSE INSERT failed:', revErr);
+            } else {
+              console.log('fifo_allocations REVERSE: inserted', reverseRows.length, 'rows for', s.invno,
+                '| total OUT='+outRows.length+' already-reversed='+alreadyReversedIds.size+' new='+reverseRows.length);
+            }
+          }
+        }
+      } catch(e) { console.error('fifo_allocations REVERSE error:', e); }
     }
   }
 
@@ -6036,7 +6100,7 @@ async function restoreSell(id) {
     } catch(e) { console.warn('restore sell_tax:', e); }
   }
 
-  // ตัดสต๊อคคืน (reverse the VOID — หักสต๊อคกลับ)
+  // re-deduct stock (reverse the Void — sale is active again)
   var hasItems = Array.isArray(s.items) && s.items.filter(function(i){return i.type==='stk';}).length>0;
   if (hasItems) {
     var restoreDate = new Date().toISOString().split('T')[0];
@@ -6044,9 +6108,16 @@ async function restoreSell(id) {
       var st = stock.find(function(x){ return x.name===item.name; });
       if (!st) return;
       var deductQty = Math.abs(+(item.qty||0));
-      // ลบ batch VOID ที่เคยเพิ่มไว้
-      st.batches = st.batches.filter(function(b){ return b.billRef !== 'VOID:'+s.invno; });
-      st.total = Math.max(0, Math.round(((+st.total||0) - deductQty)*100)/100);
+      // re-apply FIFO deduction: take from oldest batches first
+      // mirrors the original Sale deduction — no synthetic batch removal needed
+      var rem = deductQty;
+      st.batches.forEach(function(b){
+        if (rem <= 0) return;
+        var take = Math.min(b.qty, rem);
+        b.qty = Math.round((b.qty - take) * 1000) / 1000;
+        rem -= take;
+      });
+      st.total = Math.max(0, Math.round(((+st.total||0) - deductQty) * 100) / 100);
       _movements.unshift({
         type:'RESTORE', item_name:item.name, code:item.code||'', unit:item.unit||'',
         qty:-deductQty, cost:+(item.cost||st.cost||0),
@@ -6055,6 +6126,101 @@ async function restoreSell(id) {
       });
     });
     saveDB();
+
+    // sync stock_batches + stock_items.total_qty to Supabase
+    if (_sbMode==='online' && SB_URL && SB_KEY) {
+      (async function() {
+        try {
+          if (!_stockMaster || !_stockMaster.length) await loadStockMaster();
+          var _tok = await getToken();
+          for (var ri = 0; ri < s.items.length; ri++) {
+            var rItem = s.items[ri];
+            if (!rItem.name || rItem.type !== 'stk') continue;
+            var sbItem = _stockMaster.find(function(sm){
+              return (rItem.code && sm.code===rItem.code) || sm.name===rItem.name;
+            });
+            if (!sbItem) continue;
+            var localSt = stock.find(function(x){ return x.name===rItem.name; });
+            // sync batch qtys
+            if (localSt) await syncBatchesToSupabase(localSt, sbItem.id, _tok);
+            // sync total_qty from live Supabase to avoid stale reads
+            var r = await fetch(SB_URL+'/rest/v1/stock_items?id=eq.'+sbItem.id+'&select=total_qty',
+              { headers: authHeaders(_tok) });
+            var rows = r.ok ? await r.json() : [];
+            var currentQty = (rows[0] && rows[0].total_qty != null) ? +rows[0].total_qty : 0;
+            var newQty = Math.max(0, currentQty - Math.abs(+(rItem.qty||0)));
+            await fetch(SB_URL+'/rest/v1/stock_items?id=eq.'+sbItem.id, {
+              method:'PATCH',
+              headers: authHeaders(_tok, {'Content-Type':'application/json'}),
+              body: JSON.stringify({total_qty: newQty})
+            });
+            var sm2 = _stockMaster.find(function(x){ return x.id===sbItem.id; });
+            if (sm2) sm2.total_qty = newQty;
+          }
+        } catch(e) { console.warn('restore stock sync:', e); }
+      })();
+    }
+    // INSERT fifo_allocations OUT — only for REVERSE rows not yet restored
+    // Restore OUT rows carry restored_allocation_id = REVERSE.id; original Sale OUT rows carry NULL.
+    // idempotency is derived from the set of unrestored REVERSE rows — not from a row-existence check.
+    // this supports multi-cycle lifecycle: Sale → Void → Restore → Void → Restore (idempotent)
+    if (_sbMode==='online' && SB_URL && SB_KEY) {
+      try {
+        var _rTok = await getToken();
+        var _rInvEnc = encodeURIComponent(s.id);
+        // step 1: fetch all REVERSE rows for this invoice (candidates to restore)
+        var rRevResp = await fetch(
+          SB_URL+'/rest/v1/fifo_allocations?invoice_id=eq.'+_rInvEnc+'&allocation_type=eq.REVERSE&select=id,batch_id,item_id,qty_allocated,cost_per_unit',
+          { headers: authHeaders(_rTok) });
+        var reverseRows = rRevResp.ok ? await rRevResp.json() : [];
+        if (!reverseRows.length) {
+          console.warn('fifo_alloc Restore OUT: no REVERSE rows found for', s.invno,
+            '— Void allocation not recorded (pre-fifo_allocations void or offline)');
+        } else {
+          // step 2: fetch Restore OUT rows — identified by restored_allocation_id IS NOT NULL
+          // (original Sale OUT rows always have restored_allocation_id = NULL)
+          // each row's restored_allocation_id is the REVERSE row it has already compensated
+          var rOutResp = await fetch(
+            SB_URL+'/rest/v1/fifo_allocations?invoice_id=eq.'+_rInvEnc+'&allocation_type=eq.OUT&restored_allocation_id=not.is.null&select=restored_allocation_id',
+            { headers: authHeaders(_rTok) });
+          var restoreOutRows = rOutResp.ok ? await rOutResp.json() : [];
+          // step 3: build set of REVERSE ids that already have a Restore OUT row compensating them
+          var alreadyRestoredReverseIds = new Set(restoreOutRows.map(function(r){ return r.restored_allocation_id; }));
+          // step 4: filter to REVERSE rows that have not yet been restored
+          var outstandingReverse = reverseRows.filter(function(r){ return !alreadyRestoredReverseIds.has(r.id); });
+          // step 5: idempotent — nothing outstanding
+          if (!outstandingReverse.length) {
+            console.log('fifo_alloc Restore OUT: all REVERSE rows already restored for', s.invno, '— skip');
+          } else {
+            var restoreOutInsertRows = outstandingReverse.map(function(r){
+              return {
+                invoice_id: s.id,
+                invoice_no: s.invno,
+                batch_id: r.batch_id,
+                item_id: r.item_id,
+                allocation_type: 'OUT',
+                reversed_allocation_id: null,   // null for all OUT rows — only REVERSE rows carry this
+                restored_allocation_id: r.id,   // points at the REVERSE row this Restore compensates
+                qty_allocated: r.qty_allocated,
+                cost_per_unit: r.cost_per_unit
+              };
+            });
+            var rInsResp = await fetch(SB_URL+'/rest/v1/fifo_allocations', {
+              method: 'POST',
+              headers: authHeaders(_rTok, {'Content-Type':'application/json','Prefer':'return=minimal'}),
+              body: JSON.stringify(restoreOutInsertRows)
+            });
+            if (!rInsResp.ok) {
+              var rInsErr = await rInsResp.text();
+              console.error('fifo_allocations Restore OUT INSERT failed:', rInsErr);
+            } else {
+              console.log('fifo_allocations Restore OUT: inserted', restoreOutInsertRows.length, 'rows for', s.invno,
+                '| total REVERSE='+reverseRows.length+' already-restored='+alreadyRestoredReverseIds.size+' new='+restoreOutInsertRows.length);
+            }
+          }
+        }
+      } catch(e) { console.error('fifo_allocations Restore OUT error:', e); }
+    }
   }
 
   renderSellTax();
@@ -9648,17 +9814,42 @@ async function confirmSave(){
     after = -Math.abs(after); vat = -Math.abs(vat); // ยอดติดลบ
   } else {
     // ใบกำกับปกติ — ตัดสต๊อค
+    // load _stockMaster before deduction so itemId can be captured inline during FIFO loop
+    if (_sbMode==='online' && SB_URL && SB_KEY) {
+      var _smAge = window._smLoadedAt ? (Date.now() - window._smLoadedAt) : Infinity;
+      if (!_stockMaster || !_stockMaster.length || _smAge > 120000) await loadStockMaster();
+    }
     var _outItems = [];
+    var _batchAllocations = []; // [{itemId, itemName, itemCode, batchId, qty, cost}] — one entry per batch consumed
     siItems.filter(function(i){return i.name&&i.type==='stk';}).forEach(function(item){
       var s=stock.find(function(st){return st.name===item.name;}); if(!s)return;
+      // capture Supabase item UUID now, while _stockMaster is freshly loaded
+      var _smItem = _stockMaster && _stockMaster.find(function(sm){
+        return (item.code && sm.code===item.code) || sm.name===item.name;
+      });
       var rem=item.qty;
-      s.batches.forEach(function(b){if(rem<=0)return;var take=Math.min(b.qty,rem);b.qty-=take;s.total=Math.max(0,s.total-take);rem-=take;});
-      s.batches=s.batches.filter(function(b){return b.qty>0;});
+      s.batches.forEach(function(b){
+        if(rem<=0)return;
+        var take=Math.min(b.qty,rem);
+        b.qty-=take;
+        s.total=Math.max(0,s.total-take);
+        rem-=take;
+        if(take>0) _batchAllocations.push({
+          itemId: _smItem ? _smItem.id : null,
+          itemName: item.name,
+          itemCode: item.code||s.code||'',
+          batchId: b.id,
+          qty: take,
+          cost: +(b.cost||0)
+        });
+      });
+      // zero-qty batches are kept in local array — required for Void to restore
+      // to the correct batch UUID and for fifo_allocations FK integrity
       _outItems.push({name:item.name, code:item.code||s.code||'', qty:item.qty, cost:item.cost||s.cost||0});
     });
     // บันทึก stock_movement OUT ลง Supabase
     if (_sbMode==='online' && SB_URL && SB_KEY && _outItems.length) {
-      // โหลด _stockMaster ถ้าว่าง เพื่อให้หา item_id ได้
+      // _stockMaster already loaded above — just log count
       if (!_stockMaster || !_stockMaster.length) await loadStockMaster();
       console.log('OUT: _stockMaster count=', _stockMaster.length, '_outItems=', JSON.stringify(_outItems));
       getToken().then(function(_tok){
@@ -9699,6 +9890,10 @@ async function confirmSave(){
               if (sm) sm.total_qty = newQty;
             } catch(e) { console.warn('stock qty update:', e); }
           })(oi, sbItem.id);
+          // sync stock_batches — push updated qty (including zero-qty) to Supabase
+          // maintains invariant: SUM(stock_batches.qty) == stock_items.total_qty
+          var localItem = stock.find(function(st){ return st.name===oi.name; });
+          if (localItem) syncBatchesToSupabase(localItem, sbItem.id, _tok);
         });
       });
     }
@@ -9750,7 +9945,55 @@ async function confirmSave(){
     if (!taxDB.sellTax.find(function(s){ return s.invno === newSell.invNo; })) {
       taxDB.sellTax.unshift(taxSellRec);
       saveDB();
-      await checkAndSave('sell_tax', taxSellRec.id, taxSellRec, async function(){ await sbUpsertSell(taxSellRec); });
+      var sellSaveResult = await checkAndSave('sell_tax', taxSellRec.id, taxSellRec, async function(){ await sbUpsertSell(taxSellRec); });
+      // INSERT fifo_allocations OUT only when sell_tax was confirmed saved to Supabase
+      // sellSaveResult.saved === false means FK invoice_id would not exist — do not attempt INSERT
+      if (sellSaveResult && sellSaveResult.saved && _sbMode==='online' && SB_URL && SB_KEY && _batchAllocations && _batchAllocations.length) {
+        try {
+          var _allocTok = await getToken();
+          // await syncBatchesToSupabase for each unique item before fifo_allocations INSERT.
+          // guarantees stock_batches UUIDs are committed in Supabase before the FK(batch_id) check.
+          // without this, a same-session Receive → Sale or Excel-import → Sale permanently breaks
+          // allocation lineage when the fire-and-forget sync races the FK validation.
+          var _syncedItemIds = new Set();
+          for (var _si = 0; _si < _batchAllocations.length; _si++) {
+            var _ba = _batchAllocations[_si];
+            if (_ba.itemId && !_syncedItemIds.has(_ba.itemId)) {
+              var _syncLocalItem = stock.find(function(st){ return st.name===_ba.itemName; });
+              if (_syncLocalItem) await syncBatchesToSupabase(_syncLocalItem, _ba.itemId, _allocTok);
+              _syncedItemIds.add(_ba.itemId);
+            }
+          }
+          var allocRows = [];
+          _batchAllocations.forEach(function(ba){
+            // itemId was captured during FIFO deduction — no re-lookup against _stockMaster here
+            if (!ba.itemId) { console.error('fifo_alloc OUT: itemId null for', ba.itemName, '— _stockMaster was missing or offline at deduction time'); return; }
+            if (!ba.batchId) { console.error('fifo_alloc OUT: batchId null for', ba.itemName, '— batch had no UUID'); return; }
+            allocRows.push({
+              invoice_id: taxSellId,
+              invoice_no: invNo,
+              batch_id: ba.batchId,
+              item_id: ba.itemId,
+              allocation_type: 'OUT',
+              qty_allocated: ba.qty,
+              cost_per_unit: ba.cost
+            });
+          });
+          if (allocRows.length) {
+            var allocResp = await fetch(SB_URL+'/rest/v1/fifo_allocations', {
+              method: 'POST',
+              headers: authHeaders(_allocTok, {'Content-Type':'application/json','Prefer':'return=minimal'}),
+              body: JSON.stringify(allocRows)
+            });
+            if (!allocResp.ok) {
+              var allocErr = await allocResp.text();
+              console.error('fifo_allocations OUT INSERT failed:', allocErr);
+            } else {
+              console.log('fifo_allocations OUT: inserted', allocRows.length, 'rows for', invNo);
+            }
+          }
+        } catch(e) { console.error('fifo_allocations OUT error:', e); }
+      }
     }
   } else {
     console.log('Saving sell to DB:', newSell.invNo||newSell.invno, 'id:', (newSell.id||'').substring(0,8));
@@ -9776,6 +10019,7 @@ async function confirmSave(){
   setTimeout(checkAllLowStock, 1000);
   notifyNewInvoice(newSell.invNo, newSell.customer, newSell.total);
   initSI();
+  _isSaving = false;
 }
 
 
@@ -11604,7 +11848,7 @@ async function loadFromSupabase() {
     if (Array.isArray(si) && si.length) {
       stock = si.map(function(r) {
         var batches = (r.stock_batches||[]).map(function(b) {
-          return { no: b.batch_no, qty: b.qty, cost: b.cost, date: b.date, note: b.note, billRef: b.ref_invoice_id||'' };
+          return { id: b.id, no: b.batch_no, qty: b.qty, cost: b.cost, date: b.date, note: b.note, billRef: b.ref_invoice_id||'' };
         }).sort(function(a,b){ return (a.date||'').localeCompare(b.date||''); });
         var latestDate = batches.length ? batches[batches.length-1].date||'' : '';
         return { id: r.id, code: r.code||'', name: r.name, unit: r.unit, total: r.total_qty, cost: r.avg_cost,
@@ -12533,6 +12777,7 @@ async function loadStockMaster() {
         var data = await resp.json();
         if (Array.isArray(data) && data.length) {
           _stockMaster = data;
+          window._smLoadedAt = Date.now();
           console.log('loadStockMaster OK:', data.length);
           return;
         }
@@ -13264,7 +13509,7 @@ async function reloadOneStock(name) {
     var newItem = {
       code: r.code||'', name: r.name, unit: r.unit, total: r.total_qty, cost: r.avg_cost,
       batches: (r.stock_batches||[]).map(function(b){
-        return { no:b.batch_no, qty:b.qty, cost:b.cost, date:b.date, note:b.note, billRef:b.ref_invoice_id||'' };
+        return { id: b.id, no:b.batch_no, qty:b.qty, cost:b.cost, date:b.date, note:b.note, billRef:b.ref_invoice_id||'' };
       })
     };
     if (idx >= 0) stock[idx] = newItem;
@@ -13706,52 +13951,50 @@ function attachFile(table, id, onDone) {
 }
 
 // ── Sync batches ขึ้น Supabase (ใช้ใน ADJUST / saveStockEdit)
+// Strategy: stable UUID upsert — ไม่ DELETE batch เดิม
+// batch ที่ qty=0 คงอยู่ใน stock_batches เพื่อรักษา FK จาก fifo_allocations
 async function syncBatchesToSupabase(item, sbItemId, tok, _retryCount) {
   if (!sbItemId) { console.warn('syncBatches: no sbItemId'); return; }
   _retryCount = _retryCount || 0;
-  var activeBatches = (item.batches||[]).filter(function(b){ return b.qty > 0; });
+
+  // generate UUID สำหรับ batch ที่ยังไม่มี id เขียนกลับ local object ทันที
+  // เพื่อให้ sync ครั้งถัดไปใช้ UUID เดิม (stable)
+  (item.batches||[]).forEach(function(b){ if (!b.id) b.id = uid(); });
+
+  // upsert ทุก batch (ทั้ง active และ zero-qty) เพื่อสะท้อน qty ปัจจุบันที่ถูกต้อง
+  var allBatches = (item.batches||[]);
+  if (!allBatches.length) {
+    console.log('syncBatches OK:', item.name, 'no batches');
+    return;
+  }
+
+  var today = new Date().toISOString().split('T')[0];
 
   var retryOrWarn = function(reason) {
     if (_retryCount < 3) {
       console.warn('syncBatches retry #' + (_retryCount+1) + ' (' + reason + ')');
       setTimeout(function(){ syncBatchesToSupabase(item, sbItemId, tok, _retryCount+1); }, 3000 * (_retryCount+1));
     } else {
-      console.error('syncBatches: ล้มเหลวหลัง 3 ครั้ง สำหรับ', item.name, '— ข้อมูล batch ใน Supabase อาจไม่ตรงกับ local');
+      console.error('syncBatches: ล้มเหลวหลัง 3 ครั้ง สำหรับ', item.name);
       toast('⚠️ Sync batch ของ "'+item.name+'" ไม่สำเร็จ — กรุณากด Sync ตอนนี้ ภายหลัง');
     }
   };
 
   try {
-    var _tok = tok || await getToken(); // token อาจหมดอายุระหว่าง retry รอบหลัง ขอใหม่เสมอ
-    var delResp = await fetch(SB_URL+'/rest/v1/stock_batches?item_id=eq.'+sbItemId, {
-      method:'DELETE', headers: authHeaders(_tok)
+    var _tok = tok || await getToken();
+    var upsResp = await fetch(SB_URL+'/rest/v1/stock_batches?on_conflict=id', {
+      method:'POST',
+      headers: authHeaders(_tok,{'Content-Type':'application/json','Prefer':'resolution=merge-duplicates,return=minimal'}),
+      body: JSON.stringify(allBatches.map(function(b){
+        return { id:b.id, item_id:sbItemId, batch_no:b.no, qty:+(b.qty||0), cost:+(b.cost||0),
+          date:b.date||today, ref_invoice_id:b.billRef||null, note:b.note||null };
+      }))
     });
-    if (!delResp.ok) {
-      console.warn('syncBatches DELETE error:', await delResp.text());
-      retryOrWarn('delete failed');
-      return;
-    }
-
-    console.log('syncBatches: deleted old, inserting', activeBatches.length, 'batches for', item.name);
-
-    if (activeBatches.length) {
-      var insResp = await fetch(SB_URL+'/rest/v1/stock_batches', {
-        method:'POST',
-        headers: authHeaders(_tok,{'Content-Type':'application/json','Prefer':'return=minimal'}),
-        body: JSON.stringify(activeBatches.map(function(b){
-          return { item_id:sbItemId, batch_no:b.no, qty:b.qty, cost:b.cost||0,
-            date:b.date||new Date().toISOString().split('T')[0],
-            ref_invoice_id:b.billRef||null, note:b.note||null };
-        }))
-      });
-      if (!insResp.ok) {
-        console.warn('syncBatches INSERT error:', await insResp.text());
-        // DELETE สำเร็จแต่ INSERT ไม่สำเร็จ — Supabase ว่างเปล่าผิดจาก local ตอนนี้ ต้อง retry ด่วน
-        retryOrWarn('insert failed after delete succeeded');
-      }
-      else console.log('syncBatches OK:', item.name, activeBatches.length, 'batches');
+    if (!upsResp.ok) {
+      console.warn('syncBatches UPSERT error:', await upsResp.text());
+      retryOrWarn('upsert failed');
     } else {
-      console.log('syncBatches OK:', item.name, 'no batches (all cleared)');
+      console.log('syncBatches OK:', item.name, allBatches.length, 'batches upserted');
     }
   } catch(e) {
     console.warn('syncBatches error:', e);
