@@ -3179,6 +3179,40 @@ async function syncStockToSupabase() {
   // ถ้า reset mode → ลบ batch เดิมของแต่ละ item ก่อน
   if (isReset && allBatches.length) {
     var itemIds = [...new Set(allBatches.map(function(b){ return b.item_id; }))];
+
+    // GUARD: ตรวจว่ามี fifo_allocations อ้างอิง batch เดิมอยู่ไหม — ถ้ามีห้าม reset
+    var blockedItems = [];
+    for (var g = 0; g < itemIds.length; g += 20) {
+      try {
+        var gChunk = itemIds.slice(g, g + 20);
+        var gbResp = await fetch(SB_URL + '/rest/v1/stock_batches?item_id=in.(' + gChunk.join(',') + ')&select=id,item_id',
+          { headers: authHeaders(_tok) });
+        if (gbResp.ok) {
+          var existingBatches = await gbResp.json();
+          if (existingBatches.length) {
+            var existingIds = existingBatches.map(function(b){ return b.id; });
+            for (var ei = 0; ei < existingIds.length; ei += 50) {
+              var eiChunk = existingIds.slice(ei, ei + 50);
+              var faResp = await fetch(SB_URL + '/rest/v1/fifo_allocations?batch_id=in.(' + eiChunk.join(',') + ')&select=batch_id,item_id&limit=1',
+                { headers: authHeaders(_tok) });
+              if (faResp.ok) {
+                var fas = await faResp.json();
+                fas.forEach(function(fa) {
+                  var sm = _stockMaster.find(function(x){ return x.id === fa.item_id; });
+                  var label = sm ? sm.name : fa.item_id;
+                  if (blockedItems.indexOf(label) < 0) blockedItems.push(label);
+                });
+              }
+            }
+          }
+        }
+      } catch(e) { console.warn('reset guard check error:', e); }
+    }
+    if (blockedItems.length > 0) {
+      alert('⛔ ไม่สามารถ Reset ได้\n\nสินค้าต่อไปนี้มี FIFO allocations อ้างอิง batch อยู่:\n• ' + blockedItems.join('\n• ') + '\n\nกรุณา void ใบขายที่เกี่ยวข้องก่อน แล้วค่อย reset');
+      return;
+    }
+
     for (var k = 0; k < itemIds.length; k += 20) {
       var chunk = itemIds.slice(k, k+20);
       try {
