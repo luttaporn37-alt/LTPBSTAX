@@ -9040,7 +9040,7 @@ function loadStk(file, mode){
 }
 
 function parseStk(rows){
-  var C={d:0,cu:1,co:2,n:3,u:4,c:5,s:6,i:7,o:8};
+  var C={d:1,co:2,n:3,u:4,i:5,lp:6,c:8,o:-1};
   var pm={},bc={};
   for(var i=3;i<rows.length;i++){
     var row=rows[i]; if(!row)continue;
@@ -9049,12 +9049,13 @@ function parseStk(rows){
     var dv=row[C.d]; if(!dv||!String(dv).match(/\d{4}/))continue;
     var code=String(row[C.co]||'').trim(),unit=String(row[C.u]||'ชิ้น').trim();
     var cost=parseFloat(row[C.c])||0,sell=parseFloat(row[C.s])||0;
-    var inQ=parseFloat(row[C.i])||0,outQ=parseFloat(row[C.o])||0;
+    var listPrice=C.lp>=0?parseFloat(row[C.lp])||0:0;
+    var inQ=parseFloat(row[C.i])||0,outQ=C.o>=0?parseFloat(row[C.o])||0:0;
     if(!pm[name]){pm[name]={code:code,unit:unit,cost:0,sell:0,bal:0,batches:[]};bc[name]=0;}
     var p=pm[name];
     if(!p.code&&code)p.code=code; if(!p.unit&&unit)p.unit=unit;
     if(cost>0)p.cost=cost; if(sell>0)p.sell=sell;
-    if(inQ>0){bc[name]++;p.batches.push({id:uid(),no:'B'+String(bc[name]).padStart(2,'0'),qty:inQ,cost:cost||p.cost,rem:inQ,date:String(dv).substring(0,10)});p.bal+=inQ;}
+    if(inQ>0){bc[name]++;p.batches.push({id:uid(),no:'B'+String(bc[name]).padStart(2,'0'),qty:inQ,cost:cost||p.cost,list_price:listPrice,rem:inQ,date:String(dv).substring(0,10)});p.bal+=inQ;}
     if(outQ>0){var rem=outQ;p.batches.forEach(function(b){if(rem<=0)return;var take=Math.min(b.rem,rem);b.rem-=take;rem-=take;});p.bal=Math.max(0,p.bal-outQ);}
   }
   return Object.entries(pm).map(function(kv){
