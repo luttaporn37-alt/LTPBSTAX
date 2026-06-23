@@ -3153,7 +3153,7 @@ async function syncStockToSupabase() {
   // sync batches ด้วย
   var allBatches = [];
   stock.forEach(function(s) {
-    var sbItem = _stockMaster && _stockMaster.find(function(x){ return x.name===s.name||x.code===s.code; });
+    var sbItem = _stockMaster && _stockMaster.find(function(x){ var sc=s.code&&s.code!=='-'?s.code:null; return x.name===s.name||(sc&&x.code&&x.code!=='-'&&x.code===sc); });
     if (!sbItem) return;
     (s.batches||[]).forEach(function(b) {
       // ใช้ id เดิมถ้ามีอยู่แล้ว (sync ซ้ำจะ upsert ทับของเดิม ไม่ใช่สร้างใหม่ซ้อน)
@@ -9080,7 +9080,8 @@ function parseStk(rows){
     var name=row[C.n]; if(!name||typeof name!=='string')continue;
     if(name.includes('รวมทั้งหมด')||name.includes('อย่าพิมพ์')||name==='ชื่อสินค้า')continue;
     var dv=row[C.d]; if(!dv||!String(dv).match(/\d{4}/))continue;
-    var code=String(row[C.co]||'').trim(),unit=String(row[C.u]||'ชิ้น').trim();
+    var code=String(row[C.co]||'').trim(); if(code==='-'||code==='–'||code==='—')code='';
+    var unit=String(row[C.u]||'ชิ้น').trim();
     var pn=function(v){return parseFloat(String(v||'').replace(/,/g,''))||0;};
     var cost=pn(row[C.c]),sell=pn(row[C.s]);
     if(cost<0)continue; // skip rows with negative cost (credit notes)
