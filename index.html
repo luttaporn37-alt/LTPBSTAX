@@ -3112,7 +3112,7 @@ async function syncStockToSupabase() {
 
   for (var i = 0; i < stock.length; i += batchSize) {
     var batch = stock.slice(i, i + batchSize).map(function(s) {
-      var obj = {
+      return {
         code: s.code && s.code.trim() ? s.code.trim() : null,
         name: s.name || '',
         unit: s.unit || '',
@@ -3120,9 +3120,6 @@ async function syncStockToSupabase() {
         avg_cost: +(s.cost || 0),
         updated_at: new Date().toISOString()
       };
-      // ใส่ id เฉพาะตอนที่มีจาก Supabase แล้ว (ไม่สร้างใหม่)
-      if (s.id && !s.id.startsWith('loc-')) obj.id = s.id;
-      return obj;
     });
     try {
       var resp = await fetch(SB_URL + '/rest/v1/stock_items?on_conflict=name', {
@@ -3168,8 +3165,10 @@ async function syncStockToSupabase() {
         batch_no: b.no || '',
         qty: +(b.qty||0),
         cost: +(b.cost||0),
+        list_price: b.list_price || null,
         date: (function(d){ if(!d) return new Date().toISOString().split('T')[0]; var s=String(d); if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; var p=s.split('/'); if(p.length===3) return p[2]+'-'+p[1].padStart(2,'0')+'-'+p[0].padStart(2,'0'); return new Date().toISOString().split('T')[0]; })(b.date),
-        note: b.billRef || ''
+        ref_invoice_id: b.billRef || null,
+        note: b.note || null
       });
     });
   });
