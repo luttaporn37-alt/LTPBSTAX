@@ -9083,6 +9083,7 @@ function parseStk(rows){
     var code=String(row[C.co]||'').trim(),unit=String(row[C.u]||'ชิ้น').trim();
     var pn=function(v){return parseFloat(String(v||'').replace(/,/g,''))||0;};
     var cost=pn(row[C.c]),sell=pn(row[C.s]);
+    if(cost<0)continue; // skip rows with negative cost (credit notes)
     var listPrice=C.lp>=0?pn(row[C.lp]):0;
     var inQ=pn(row[C.i]),outQ=C.o>=0?pn(row[C.o]):0;
     if(!pm[name]){pm[name]={code:code,unit:unit,cost:0,sell:0,bal:0,batches:[]};bc[name]=0;}
