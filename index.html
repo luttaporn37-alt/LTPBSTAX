@@ -9040,7 +9040,7 @@ function loadStk(file, mode){
 }
 
 function parseStk(rows){
-  var C={d:1,co:2,n:3,u:4,i:5,lp:6,c:8,o:-1};
+  var C={inv:0,d:1,co:2,n:3,u:4,i:5,lp:6,c:8,o:-1};
   var pm={},bc={};
   for(var i=3;i<rows.length;i++){
     var row=rows[i]; if(!row)continue;
@@ -9055,7 +9055,7 @@ function parseStk(rows){
     var p=pm[name];
     if(!p.code&&code)p.code=code; if(!p.unit&&unit)p.unit=unit;
     if(cost>0)p.cost=cost; if(sell>0)p.sell=sell;
-    if(inQ>0){bc[name]++;p.batches.push({id:uid(),no:'B'+String(bc[name]).padStart(2,'0'),qty:inQ,cost:cost||p.cost,list_price:listPrice,rem:inQ,date:String(dv).substring(0,10)});p.bal+=inQ;}
+    if(inQ>0){bc[name]++;p.batches.push({id:uid(),no:'B'+String(bc[name]).padStart(2,'0'),qty:inQ,cost:cost||p.cost,list_price:listPrice,billRef:String(row[C.inv]||'').trim(),rem:inQ,date:String(dv).substring(0,10)});p.bal+=inQ;}
     if(outQ>0){var rem=outQ;p.batches.forEach(function(b){if(rem<=0)return;var take=Math.min(b.rem,rem);b.rem-=take;rem-=take;});p.bal=Math.max(0,p.bal-outQ);}
   }
   return Object.entries(pm).map(function(kv){
@@ -14159,6 +14159,7 @@ async function syncBatchesToSupabase(item, sbItemId, tok, _retryCount) {
         headers: authHeaders(_tok,{'Content-Type':'application/json','Prefer':'return=minimal'}),
         body: JSON.stringify(activeBatches.map(function(b){
           return { item_id:sbItemId, batch_no:b.no, qty:b.qty, cost:b.cost||0,
+            list_price:b.list_price||null,
             date:b.date||new Date().toISOString().split('T')[0],
             ref_invoice_id:b.billRef||null, note:b.note||null };
         }))
