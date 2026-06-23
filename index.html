@@ -9048,9 +9048,10 @@ function parseStk(rows){
     if(name.includes('รวมทั้งหมด')||name.includes('อย่าพิมพ์')||name==='ชื่อสินค้า')continue;
     var dv=row[C.d]; if(!dv||!String(dv).match(/\d{4}/))continue;
     var code=String(row[C.co]||'').trim(),unit=String(row[C.u]||'ชิ้น').trim();
-    var cost=parseFloat(row[C.c])||0,sell=parseFloat(row[C.s])||0;
-    var listPrice=C.lp>=0?parseFloat(row[C.lp])||0:0;
-    var inQ=parseFloat(row[C.i])||0,outQ=C.o>=0?parseFloat(row[C.o])||0:0;
+    var pn=function(v){return parseFloat(String(v||'').replace(/,/g,''))||0;};
+    var cost=pn(row[C.c]),sell=pn(row[C.s]);
+    var listPrice=C.lp>=0?pn(row[C.lp]):0;
+    var inQ=pn(row[C.i]),outQ=C.o>=0?pn(row[C.o]):0;
     if(!pm[name]){pm[name]={code:code,unit:unit,cost:0,sell:0,bal:0,batches:[]};bc[name]=0;}
     var p=pm[name];
     if(!p.code&&code)p.code=code; if(!p.unit&&unit)p.unit=unit;
