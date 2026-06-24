@@ -5567,7 +5567,7 @@ function onSellTypeChange() {
             code:item.code||'',name:item.name||'',unit:item.unit||'',
             qty:item.qty||1,price:item.price||0,cost:item.cost||0,disc:0};
         });
-        renderSiItems(); calcSI();
+        renderSI(); calcSI();
         toast('📋 โหลดสินค้าจากบิล '+refInv+' แล้ว — แก้จำนวนที่ต้องการลดได้เลย');
       }
     }
@@ -13565,7 +13565,7 @@ function loadCNItems(invno) {
   if (src.customer) document.getElementById('scn').value = src.customer;
   if (src.taxid||src.custTax) document.getElementById('sctax').value = src.taxid||src.custTax||'';
   if (src.custAddr) document.getElementById('sca').value = src.custAddr||'';
-  renderSiItems(); calcSI();
+  renderSI(); calcSI();
   document.getElementById('cn-items-hint').innerHTML = '✅ โหลดสินค้า '+siItems.length+' รายการจากบิล '+invno+' — <b style="color:var(--danger)">แก้จำนวนที่ต้องการลดได้เลย</b>';
   toast('📋 โหลดสินค้าจากบิล '+invno+' แล้ว');
 }
@@ -13585,7 +13585,7 @@ function loadDeliveryRef(invno) {
         code:item.code||'',name:item.name||'',unit:item.unit||'',
         qty:item.qty||1,price:item.price||0,cost:item.cost||0,disc:0};
     });
-    renderSiItems(); calcSI();
+    renderSI(); calcSI();
   }
   toast('📦 โหลดข้อมูลจากบิล '+invno+' แล้ว');
 }
