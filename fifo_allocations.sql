@@ -79,6 +79,12 @@ create table if not exists public.fifo_allocations (
   total_cost              numeric(14,2) generated always as
                             (qty_allocated * cost_per_unit) stored,
 
+  -- audit snapshot of the batch at allocation time (independent of batch row)
+  batch_no                text          null,
+  batch_date              date          null,
+
+  created_by              text          null,
+
   allocated_at            timestamptz   not null default now(),
   created_at              timestamptz   not null default now()
 );

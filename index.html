@@ -5809,7 +5809,7 @@ async function _doVoidSell(id, reason) {
         itemAllocs.forEach(function(a){
           reverseAllocationRows.push({
             invoice_id:id, invoice_no:s.invno, item_id:sbItem.id, batch_id:a.batch_id,
-            batch_no:a.batch_no, batch_date:a.batch_date, qty:a.qty, cost:a.cost, allocation_type:'REVERSE',
+            batch_no:a.batch_no, batch_date:a.batch_date, qty_allocated:a.qty_allocated, cost_per_unit:a.cost_per_unit, allocation_type:'REVERSE',
             reversed_allocation_id:a.id, created_by:(typeof LTP_ROLE!=='undefined'&&LTP_ROLE)||'unknown'
           });
         });
@@ -5824,9 +5824,9 @@ async function _doVoidSell(id, reason) {
           // rollback: หักกลับเท่าที่เพิ่งคืนไป
           p.allocs.forEach(function(a){
             var b = p.st.batches.find(function(bb){ return bb.id===a.batch_id; });
-            if (b) b.qty = Math.max(0, Math.round(((+b.qty||0) - (+a.qty||0))*100)/100);
+            if (b) b.qty = Math.max(0, Math.round(((+b.qty||0) - (+a.qty_allocated||0))*100)/100);
           });
-          p.st.total = Math.max(0, Math.round(((+p.st.total||0) - p.allocs.reduce(function(s2,a){return s2+(+a.qty||0);},0))*100)/100);
+          p.st.total = Math.max(0, Math.round(((+p.st.total||0) - p.allocs.reduce(function(s2,a){return s2+(+a.qty_allocated||0);},0))*100)/100);
         });
         toast('⛔ Void ไม่สำเร็จ — บันทึก reverse allocation ไม่ได้: '+e.message);
         console.error('VOID reverse allocation save error:', e);
@@ -6122,9 +6122,9 @@ async function restoreSell(id) {
         perItemAllocations.push({ item: item, st: st, sbItem: sbItem, allocs: allocs });
         allocs.forEach(function(a) {
           allAllocationRows.push({
-            invoice_id: id, invoice_no: s.invno||null, item_id: sbItem.id,
+            invoice_id: id, invoice_no: s.invno, item_id: sbItem.id,
             batch_id: a.batchId, batch_no: a.batchNo, batch_date: a.batchDate,
-            qty: a.qty, cost: a.cost,
+            qty_allocated: a.qty, cost_per_unit: a.cost,
             allocation_type: 'OUT', created_by: (typeof LTP_ROLE!=='undefined'&&LTP_ROLE)||'unknown'
           });
         });
@@ -9922,6 +9922,7 @@ async function confirmSave(){
 
       // ── ขั้นที่ 2: Allocate FIFO จริง (mutate local) ──
       var invNoVal = document.getElementById('sin')?.dataset.docNo || document.getElementById('sin')?.value || '';
+      if (!invNoVal) { toast('⛔ บันทึกไม่สำเร็จ — กรุณาระบุเลขที่ใบกำกับก่อนบันทึก'); return; }
       var dateVal = document.getElementById('sdt')?.value || new Date().toISOString().split('T')[0];
       var allAllocRowsSale = [];
       var perItemSale = [];
@@ -9935,9 +9936,9 @@ async function confirmSave(){
           perItemSale.push({ item: item, st: st, sbItem: sbItem, allocs: allocs });
           allocs.forEach(function(a) {
             allAllocRowsSale.push({
-              invoice_id: newSellIdForAllocation, invoice_no: invNoVal||null, item_id: sbItem.id,
+              invoice_id: newSellIdForAllocation, invoice_no: invNoVal, item_id: sbItem.id,
               batch_id: a.batchId, batch_no: a.batchNo, batch_date: a.batchDate,
-              qty: a.qty, cost: a.cost,
+              qty_allocated: a.qty, cost_per_unit: a.cost,
               allocation_type: 'OUT', created_by: (typeof LTP_ROLE!=='undefined'&&LTP_ROLE)||'unknown'
             });
           });
